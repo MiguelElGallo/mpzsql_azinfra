@@ -1,0 +1,85 @@
+name: Bicep What-If Analysis for New Infrastructure
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'INFRA-NEW/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AZURE_RESOURCE_GROUP: 'RG-MPZSQL'
+  LOCATION: 'swedencentral'
+
+jobs:
+  what-if:
+    runs-on: ubuntu-latest
+    name: What-If Analysis
+    environment: deploy-env
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Azure CLI
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Setup Bicep
+      run: |
+        curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+        chmod +x ./bicep
+        sudo mv ./bicep /usr/local/bin/bicep
+
+    - name: Validate Bicep Templates
+      run: |
+        cd INFRA-NEW
+        bicep build main.bicep
+
+    - name: Run What-If Analysis
+      id: whatif
+      run: |
+        cd INFRA-NEW
+        az deployment group what-if \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --template-file main.bicep \
+          --parameters main.bicepparam \
+          --no-pretty-print > whatif-output.json
+
+    - name: Comment What-If Results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const whatifOutput = fs.readFileSync('INFRA-NEW/whatif-output.json', 'utf8');
+          
+          const comment = `## 🔍 Bicep What-If Analysis Results
+          
+          ### Infrastructure Changes Preview
+          
+          \`\`\`json
+          ${whatifOutput}
+          \`\`\`
+          
+          Please review the changes before deployment.`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+
+    - name: Upload What-If Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: whatif-results
+        path: INFRA-NEW/whatif-output.json

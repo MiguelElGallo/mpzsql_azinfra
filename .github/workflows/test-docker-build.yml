@@ -1,0 +1,24 @@
+name: Test Docker Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to use for testing'
+        required: false
+        type: choice
+        default: 'deploy-env'
+        options:
+        - deploy-env
+        - staging
+        - prod
+
+jobs:
+  test-build:
+    name: Test Docker Build and Push
+    uses: ./.github/workflows/build-and-push-image.yml
+    with:
+      environment: ${{ inputs.environment || 'deploy-env' }}
+      image_tag_prefix: 'test'
+      registry_cleanup: false # Don't clean during testing
+    secrets: inherit

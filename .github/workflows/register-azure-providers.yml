@@ -1,0 +1,119 @@
+name: Register Azure Providers
+
+on:
+  workflow_call: # Makes this workflow reusable by other workflows
+    inputs:
+      environment:
+        description: 'Environment to use for secrets'
+        required: false
+        type: string
+        default: 'deploy-env'
+  workflow_dispatch: # Allows manual triggering
+    inputs:
+      environment:
+        description: 'Environment to use for secrets'
+        required: false
+        type: choice
+        default: 'deploy-env'
+        options:
+        - deploy-env
+        - staging
+        - prod
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  register-providers:
+    runs-on: ubuntu-latest
+    name: Register Required Azure Providers
+    environment: ${{ inputs.environment || 'deploy-env' }}
+    
+    steps:
+    - name: Log in to Azure
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Register Azure Resource Providers
+      run: |
+        echo "🔧 Registering Azure Resource Providers..."
+        
+        # List of providers required based on the infrastructure
+        providers=(
+          "Microsoft.App"                    # Container Apps
+          "Microsoft.ContainerService"       # Container Services (mentioned in error)
+          "Microsoft.Storage"                # Storage Accounts
+          "Microsoft.KeyVault"              # Key Vault
+          "Microsoft.DBforPostgreSQL"       # PostgreSQL Flexible Server
+          "Microsoft.Network"               # Virtual Networks, DNS
+          "Microsoft.OperationalInsights"   # Log Analytics
+          "Microsoft.ManagedIdentity"       # Managed Identities
+          "Microsoft.ContainerRegistry"     # Container Registry
+          "Microsoft.Insights"              # Application Insights
+          "Microsoft.DocumentDB"            # Cosmos DB (used in some deployments)
+          "Microsoft.Resources"             # Resource Groups
+        )
+        
+        for provider in "${providers[@]}"; do
+          echo "📋 Checking registration status for $provider..."
+          
+          # Check current registration state
+          state=$(az provider show --namespace "$provider" --query "registrationState" -o tsv 2>/dev/null || echo "NotFound")
+          
+          if [ "$state" = "Registered" ]; then
+            echo "✅ $provider is already registered"
+          elif [ "$state" = "Registering" ]; then
+            echo "⏳ $provider is currently registering, waiting..."
+            az provider register --namespace "$provider" --wait
+            echo "✅ $provider registration completed"
+          else
+            echo "🔄 Registering $provider..."
+            az provider register --namespace "$provider" --wait
+            echo "✅ $provider registered successfully"
+          fi
+        done
+        
+        echo ""
+        echo "🎉 All required Azure providers are now registered!"
+        echo ""
+        echo "📋 Provider Registration Summary:"
+        for provider in "${providers[@]}"; do
+          state=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+          echo "  - $provider: $state"
+        done
+
+    - name: Verify Provider Registration
+      run: |
+        echo "🔍 Verifying all providers are properly registered..."
+        
+        # Critical providers that must be registered for deployment to succeed
+        critical_providers=("Microsoft.App" "Microsoft.ContainerService")
+        
+        all_registered=true
+        for provider in "${critical_providers[@]}"; do
+          state=$(az provider show --namespace "$provider" --query "registrationState" -o tsv)
+          if [ "$state" != "Registered" ]; then
+            echo "❌ Critical provider $provider is not registered (state: $state)"
+            all_registered=false
+          else
+            echo "✅ Critical provider $provider is registered"
+          fi
+        done
+        
+        if [ "$all_registered" = false ]; then
+          echo "❌ Some critical providers are not registered. Deployment may fail."
+          exit 1
+        else
+          echo "✅ All critical providers are registered. Ready for deployment!"
+        fi
+
+    - name: Log out from Azure
+      if: always()
+      run: |
+        az logout
+        az cache purge
+        az account clear

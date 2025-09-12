@@ -1,0 +1,259 @@
+name: Build and Push Docker Image
+
+on:
+  workflow_call: # Makes this workflow reusable by other workflows
+    inputs:
+      environment:
+        description: 'Environment to use for secrets'
+        required: false
+        type: string
+        default: 'deploy-env'
+      image_tag_prefix:
+        description: 'Prefix for the image tag (default: timestamp)'
+        required: false
+        type: string
+        default: ''
+      registry_cleanup:
+        description: 'Whether to clean old images from registry'
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image_name:
+        description: 'Name of the built Docker image'
+        value: ${{ jobs.build-and-push.outputs.image_name }}
+      image_tag:
+        description: 'Tag of the built Docker image'
+        value: ${{ jobs.build-and-push.outputs.image_tag }}
+      registry_name:
+        description: 'Name of the Azure Container Registry'
+        value: ${{ jobs.build-and-push.outputs.registry_name }}
+  workflow_dispatch: # Allows manual triggering
+    inputs:
+      environment:
+        description: 'Environment to use for secrets'
+        required: false
+        type: choice
+        default: 'deploy-env'
+        options:
+        - deploy-env
+        - staging
+        - prod
+      image_tag_prefix:
+        description: 'Prefix for the image tag (default: timestamp)'
+        required: false
+        type: string
+        default: ''
+      registry_cleanup:
+        description: 'Whether to clean old images from registry'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    name: Build and Push Docker Image to Azure Container Registry
+    environment: ${{ inputs.environment || 'deploy-env' }}
+    
+    outputs:
+      image_name: ${{ steps.build-vars.outputs.image_name }}
+      image_tag: ${{ steps.build-vars.outputs.image_tag }}
+      registry_name: ${{ steps.azure-registry.outputs.registry_name }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up build variables
+      id: build-vars
+      run: |
+        # Generate timestamp for image tag
+        TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+        
+        # Set image tag with optional prefix
+        if [ -n "${{ inputs.image_tag_prefix }}" ]; then
+          IMAGE_TAG="${{ inputs.image_tag_prefix }}-${TIMESTAMP}"
+        else
+          IMAGE_TAG="${TIMESTAMP}"
+        fi
+        
+        echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+        echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+        echo "image_name=mpzsql" >> $GITHUB_OUTPUT
+        
+        echo "🏷️ Image tag: ${IMAGE_TAG}"
+
+    - name: Log in to Azure
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Find Azure Container Registry
+      id: azure-registry
+      run: |
+        echo "🔍 Finding Azure Container Registry..."
+        
+        # Query for container registries with specific tags
+        REGISTRY_NAME=$(az acr list \
+          --query "[?tags.environment=='dev' && tags.application=='mpzsql'].name | [0]" \
+          --output tsv)
+        
+        if [ -z "$REGISTRY_NAME" ] || [ "$REGISTRY_NAME" = "null" ]; then
+          echo "⚠️ No registry found with tags. Trying alternative approach..."
+          
+          # Alternative: find registry by name pattern (mpzsql + dev + acr)
+          REGISTRY_NAME=$(az acr list \
+            --query "[?starts_with(name, 'mpzsqldev') && contains(name, 'acr')].name | [0]" \
+            --output tsv)
+        fi
+        
+        if [ -z "$REGISTRY_NAME" ] || [ "$REGISTRY_NAME" = "null" ]; then
+          echo "❌ Could not find Azure Container Registry"
+          echo "Available registries:"
+          az acr list --query "[].{Name:name, ResourceGroup:resourceGroup, Tags:tags}" --output table
+          exit 1
+        fi
+        
+        echo "registry_name=${REGISTRY_NAME}" >> $GITHUB_OUTPUT
+        echo "✅ Found registry: ${REGISTRY_NAME}"
+
+    - name: Login to Azure Container Registry
+      run: |
+        echo "🔐 Logging in to Azure Container Registry..."
+        az acr login --name ${{ steps.azure-registry.outputs.registry_name }}
+
+    - name: Download MPZSQL Server
+      run: |
+        echo "📥 Downloading latest MPZSQL server..."
+        chmod +x ./scripts/download-mpzsql.sh
+        # Force clean download in CI to ensure we have the latest version
+        FORCE_CLEAN=true ./scripts/download-mpzsql.sh
+
+    - name: Prepare TLS Certificates
+      run: |
+        echo "🔐 Checking for TLS certificates..."
+        
+        # Check if both TLS secrets exist
+        if [ -n "${{ secrets.LETSENCRYPT_CERT }}" ] && [ -n "${{ secrets.LETSENCRYPT_KEY }}" ]; then
+          echo "✅ LetsEncrypt certificates found in secrets"
+          
+          # Create certs directory in build context
+          mkdir -p ./certs
+          
+          # Write certificate files with specific names for LetsEncrypt
+          echo "${{ secrets.LETSENCRYPT_CERT }}" > ./certs/letsencrypt.crt
+          echo "${{ secrets.LETSENCRYPT_KEY }}" > ./certs/letsencrypt.key
+          
+          # Set permissions for security
+          chmod 644 ./certs/letsencrypt.crt
+          chmod 600 ./certs/letsencrypt.key
+          
+          # Set environment variable to indicate TLS is available
+          echo "TLS_ENABLED=true" >> $GITHUB_ENV
+          echo "🔐 LetsEncrypt TLS certificates saved successfully"
+        else
+          echo "ℹ️ No LetsEncrypt certificates found in secrets - TLS will be disabled"
+          echo "TLS_ENABLED=false" >> $GITHUB_ENV
+        fi
+
+    - name: Build Docker Image
+      env:
+        IMAGE_NAME: ${{ steps.azure-registry.outputs.registry_name }}.azurecr.io/${{ steps.build-vars.outputs.image_name }}
+        IMAGE_TAG: ${{ steps.build-vars.outputs.image_tag }}
+        # TLS configuration
+        TLS_ENABLED: ${{ env.TLS_ENABLED }}
+        # Environment variables for Docker build
+        POSTGRESQL_SERVER: ${{ secrets.POSTGRESQL_SERVER }}
+        POSTGRESQL_USER: ${{ secrets.POSTGRESQL_USER }}
+        POSTGRESQL_PORT: ${{ secrets.POSTGRESQL_PORT }}
+        POSTGRESQL_PASSWORD: ${{ secrets.POSTGRESQL_PASSWORD }}
+        POSTGRESQL_CATALOGDB: ${{ secrets.POSTGRESQL_CATALOGDB }}
+        LOGFIRE_WRITE_TOKEN: ${{ secrets.LOGFIRE_WRITE_TOKEN }}
+        AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+        AZURE_STORAGE_CONTAINER: ${{ secrets.AZURE_STORAGE_CONTAINER }}
+        LETSENCRYPT_CERT: ${{ secrets.LETSENCRYPT_CERT }}
+        LETSENCRYPT_KEY: ${{ secrets.LETSENCRYPT_KEY }}
+      run: |
+        echo "🏗️ Building Docker image..."
+        chmod +x ./scripts/build-image.sh
+        ./scripts/build-image.sh
+
+    - name: Push Docker Image
+      run: |
+        echo "🚀 Pushing Docker image to registry..."
+        IMAGE_FULL_NAME="${{ steps.azure-registry.outputs.registry_name }}.azurecr.io/${{ steps.build-vars.outputs.image_name }}:${{ steps.build-vars.outputs.image_tag }}"
+        
+        docker push "${IMAGE_FULL_NAME}"
+        echo "✅ Image pushed successfully: ${IMAGE_FULL_NAME}"
+
+    - name: Clean Old Images
+      if: ${{ inputs.registry_cleanup }}
+      run: |
+        echo "🧹 Cleaning old images from registry..."
+        REGISTRY_NAME="${{ steps.azure-registry.outputs.registry_name }}"
+        IMAGE_NAME="${{ steps.build-vars.outputs.image_name }}"
+        
+        # Get all tags for the repository, sorted by creation date (newest first)
+        echo "📋 Fetching image tags..."
+        TAGS=$(az acr repository show-tags \
+          --name "${REGISTRY_NAME}" \
+          --repository "${IMAGE_NAME}" \
+          --orderby time_desc \
+          --output tsv)
+        
+        if [ -z "$TAGS" ]; then
+          echo "ℹ️ No tags found for repository ${IMAGE_NAME}"
+          exit 0
+        fi
+        
+        # Convert to array
+        TAG_ARRAY=($TAGS)
+        TAG_COUNT=${#TAG_ARRAY[@]}
+        
+        echo "📊 Found ${TAG_COUNT} tags in repository ${IMAGE_NAME}"
+        
+        # Keep only the latest 2 images, delete the rest
+        if [ ${TAG_COUNT} -gt 2 ]; then
+          TAGS_TO_DELETE=${TAG_ARRAY[@]:2}
+          echo "🗑️ Deleting $(( TAG_COUNT - 2 )) old image(s)..."
+          
+          for tag in ${TAGS_TO_DELETE}; do
+            echo "   Deleting ${IMAGE_NAME}:${tag}..."
+            az acr repository delete \
+              --name "${REGISTRY_NAME}" \
+              --image "${IMAGE_NAME}:${tag}" \
+              --yes
+          done
+          
+          echo "✅ Cleanup completed. Kept latest 2 images:"
+          echo "   - ${IMAGE_NAME}:${TAG_ARRAY[0]}"
+          echo "   - ${IMAGE_NAME}:${TAG_ARRAY[1]}"
+        else
+          echo "ℹ️ Only ${TAG_COUNT} image(s) found. No cleanup needed."
+        fi
+
+    - name: Summary
+      run: |
+        echo "🎉 Build and push completed successfully!"
+        echo ""
+        echo "📋 Summary:"
+        echo "  Registry: ${{ steps.azure-registry.outputs.registry_name }}.azurecr.io"
+        echo "  Image: ${{ steps.build-vars.outputs.image_name }}"
+        echo "  Tag: ${{ steps.build-vars.outputs.image_tag }}"
+        echo "  Full name: ${{ steps.azure-registry.outputs.registry_name }}.azurecr.io/${{ steps.build-vars.outputs.image_name }}:${{ steps.build-vars.outputs.image_tag }}"
+        echo ""
+        echo "🚀 Image is ready for deployment!"
+
+    - name: Log out from Azure
+      if: always()
+      run: |
+        az logout
+        az cache purge
+        az account clear

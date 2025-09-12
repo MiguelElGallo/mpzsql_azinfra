@@ -1,0 +1,412 @@
+name: Deploy New Infrastructure with Bicep
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'INFRA-NEW/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'deploy-env'
+        type: choice
+        options:
+        - deploy-env
+        - staging
+        - prod
+      keyvault_action:
+        description: 'Action for soft-deleted Key Vaults'
+        required: true
+        default: 'recover'
+        type: choice
+        options:
+        - recover
+        - skip
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_RESOURCE_GROUP: 'RG-MPZSQL'
+  LOCATION: 'swedencentral'
+
+jobs:
+  register-providers:
+    uses: ./.github/workflows/register-azure-providers.yml
+    with:
+      environment: ${{ inputs.environment || 'deploy-env' }}
+    secrets: inherit
+
+  validate:
+    needs: register-providers
+    runs-on: ubuntu-latest
+    name: Validate Templates
+    environment: ${{ inputs.environment || 'deploy-env' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Azure CLI
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Setup Bicep
+      run: |
+        curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+        chmod +x ./bicep
+        sudo mv ./bicep /usr/local/bin/bicep
+
+    - name: Validate Bicep Templates
+      run: |
+        cd INFRA-NEW
+        # Make validation script executable
+        chmod +x validate-bicep.sh
+        # Run comprehensive validation (skip what-if for CI/CD)
+        ./validate-bicep.sh --skip-whatif
+        
+    - name: Validate Deployment
+      run: |
+        cd INFRA-NEW
+        echo "Validating main deployment..."
+        az deployment group validate \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --template-file main.bicep \
+          --parameters main.bicepparam
+        
+        echo "✅ Main template validation passed"
+        echo "⏭️ Role assignments template will be validated during deployment phase"
+
+    - name: Upload Generated ARM Templates
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: generated-arm-templates
+        path: |
+          INFRA-NEW/generated-arm/
+          INFRA-NEW/compiled/
+        retention-days: 30
+
+  deploy:
+    needs: [register-providers, validate]
+    runs-on: ubuntu-latest
+    name: Deploy Infrastructure
+    environment: ${{ inputs.environment || 'dev' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Azure CLI
+      uses: azure/login@v1
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Setup Bicep
+      run: |
+        curl -Lo bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+        chmod +x ./bicep
+        sudo mv ./bicep /usr/local/bin/bicep
+
+    - name: Handle Soft-Deleted Key Vault
+      run: |
+        echo "Checking for soft-deleted Key Vaults..."
+        echo "Key Vault Action: ${{ inputs.keyvault_action || 'recover' }}"
+        
+        # List all soft-deleted Key Vaults in our subscription for our location
+        echo "Listing soft-deleted Key Vaults in location: ${{ env.LOCATION }}"
+        DELETED_VAULTS=$(az keyvault list-deleted \
+          --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }} \
+          --resource-type vault \
+          --query "[?properties.location=='${{ env.LOCATION }}'].name" \
+          --output tsv 2>/dev/null || echo "")
+        
+        if [ ! -z "$DELETED_VAULTS" ]; then
+          echo "Found soft-deleted Key Vault(s) in ${{ env.LOCATION }}:"
+          echo "$DELETED_VAULTS"
+          
+          # For each deleted vault
+          for VAULT_NAME in $DELETED_VAULTS; do
+            echo "Processing soft-deleted Key Vault: $VAULT_NAME"
+            
+            case "${{ inputs.keyvault_action || 'recover' }}" in
+              "recover")
+                echo "Recovering soft-deleted Key Vault: $VAULT_NAME"
+                az keyvault recover \
+                  --subscription ${{ secrets.AZURE_SUBSCRIPTION_ID }} \
+                  --name "$VAULT_NAME" \
+                  --location "${{ env.LOCATION }}" \
+                  --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+                  --no-wait
+                echo "Recovery initiated for $VAULT_NAME"
+                ;;
+              "skip")
+                echo "Skipping soft-deleted Key Vault: $VAULT_NAME (as requested)"
+                ;;
+            esac
+          done
+          
+          # Wait for recovery operations to complete
+          if [ "${{ inputs.keyvault_action || 'recover' }}" = "recover" ]; then
+            echo "Waiting 60 seconds for recovery operations to complete..."
+            sleep 60
+            
+            # Verify recovery status
+            for VAULT_NAME in $DELETED_VAULTS; do
+              echo "Checking recovery status for $VAULT_NAME..."
+              STATUS=$(az keyvault show \
+                --name "$VAULT_NAME" \
+                --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+                --query "properties.provisioningState" \
+                --output tsv 2>/dev/null || echo "Failed")
+              echo "Key Vault $VAULT_NAME status: $STATUS"
+            done
+          fi
+        else
+          echo "No soft-deleted Key Vaults found in ${{ env.LOCATION }}."
+        fi
+
+    - name: Deploy Infrastructure
+      id: deploy
+      run: |
+        cd INFRA-NEW
+        echo "Deploying main infrastructure..."
+        deployment_output=$(az deployment group create \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --template-file main.bicep \
+          --parameters main.bicepparam \
+          --query 'properties.outputs' \
+          --output json)
+        
+        echo "Main deployment completed. Extracting outputs..."
+        echo "$deployment_output" | jq '.'
+        
+        # Extract outputs for role assignments
+        containerAppPrincipalId=$(echo "$deployment_output" | jq -r '.containerAppSystemAssignedIdentityId.value')
+        userAssignedIdentityPrincipalId=$(echo "$deployment_output" | jq -r '.userAssignedIdentityPrincipalId.value')
+        keyVaultResourceId=$(echo "$deployment_output" | jq -r '.keyVaultResourceId.value')
+        storageAccountResourceId=$(echo "$deployment_output" | jq -r '.storageAccountResourceId.value')
+        containerRegistryResourceId=$(echo "$deployment_output" | jq -r '.containerRegistryResourceId.value')
+        postgresServerResourceId=$(echo "$deployment_output" | jq -r '.postgresServerResourceId.value')
+        
+        echo "Deploying role assignments..."
+        az deployment group create \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --template-file role-assignments.bicep \
+          --parameters containerAppPrincipalId="$containerAppPrincipalId" \
+                      userAssignedIdentityPrincipalId="$userAssignedIdentityPrincipalId" \
+                      keyVaultResourceId="$keyVaultResourceId" \
+                      storageAccountResourceId="$storageAccountResourceId" \
+                      containerRegistryResourceId="$containerRegistryResourceId" \
+                      postgresServerResourceId="$postgresServerResourceId" \
+          --verbose
+
+    - name: Configure Container Registry Access for Contributors
+      run: |
+        echo "🔍 Identifying users with Contributor access and granting Container Registry roles..."
+        
+        # Get the Container Registry name from the deployment
+        CONTAINER_REGISTRY_NAME=$(az acr list \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --query "[0].name" \
+          --output tsv)
+        
+        if [ -z "$CONTAINER_REGISTRY_NAME" ]; then
+          echo "❌ No Container Registry found in resource group"
+          exit 1
+        fi
+        
+        echo "📦 Container Registry: $CONTAINER_REGISTRY_NAME"
+        
+        # Get all role assignments for the resource group with Contributor role
+        echo "🔍 Finding users with Contributor access to resource group..."
+        CONTRIBUTOR_ROLE_ID="b24988ac-6180-42a0-ab88-20f7382dd24c"
+        
+        # Get all contributors (users and service principals) from resource group
+        CONTRIBUTORS=$(az role assignment list \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --role "$CONTRIBUTOR_ROLE_ID" \
+          --query "[].{principalId:principalId,principalType:principalType,displayName:principalName}" \
+          --output json)
+        
+        echo "Found contributors:"
+        echo "$CONTRIBUTORS" | jq -r '.[] | "- \(.displayName) (\(.principalType)): \(.principalId)"'
+        
+        # Role definitions for Container Registry
+        ACR_PUSH_ROLE="8311e382-0749-4cb8-b61a-304f252e45ec"
+        ACR_REPO_CONTRIBUTOR_ROLE="c2f4ef07-c644-48eb-af81-4b1b4947fb11"
+        
+        # Get Container Registry resource ID
+        CONTAINER_REGISTRY_ID=$(az acr show \
+          --name "$CONTAINER_REGISTRY_NAME" \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --query "id" \
+          --output tsv)
+        
+        echo "📝 Granting Container Registry roles to contributors..."
+        
+        # Process each contributor
+        echo "$CONTRIBUTORS" | jq -c '.[]' | while read -r contributor; do
+          PRINCIPAL_ID=$(echo "$contributor" | jq -r '.principalId')
+          PRINCIPAL_TYPE=$(echo "$contributor" | jq -r '.principalType')
+          DISPLAY_NAME=$(echo "$contributor" | jq -r '.displayName // "Unknown"')
+          
+          echo "Processing: $DISPLAY_NAME ($PRINCIPAL_TYPE)"
+          
+          # Check if principal already has AcrPush role
+          EXISTING_ACR_PUSH=$(az role assignment list \
+            --assignee "$PRINCIPAL_ID" \
+            --scope "$CONTAINER_REGISTRY_ID" \
+            --role "$ACR_PUSH_ROLE" \
+            --query "length(@)" \
+            --output tsv 2>/dev/null || echo "0")
+          
+          # Check if principal already has Container Registry Repository Contributor role
+          EXISTING_ACR_REPO=$(az role assignment list \
+            --assignee "$PRINCIPAL_ID" \
+            --scope "$CONTAINER_REGISTRY_ID" \
+            --role "$ACR_REPO_CONTRIBUTOR_ROLE" \
+            --query "length(@)" \
+            --output tsv 2>/dev/null || echo "0")
+          
+          # Assign AcrPush role if not already assigned
+          if [ "$EXISTING_ACR_PUSH" = "0" ]; then
+            echo "  ✅ Assigning AcrPush role to $DISPLAY_NAME..."
+            az role assignment create \
+              --assignee "$PRINCIPAL_ID" \
+              --role "$ACR_PUSH_ROLE" \
+              --scope "$CONTAINER_REGISTRY_ID" \
+              --output none
+          else
+            echo "  ⏭️  AcrPush role already assigned to $DISPLAY_NAME"
+          fi
+          
+          # Assign Container Registry Repository Contributor role if not already assigned
+          if [ "$EXISTING_ACR_REPO" = "0" ]; then
+            echo "  ✅ Assigning Container Registry Repository Contributor role to $DISPLAY_NAME..."
+            az role assignment create \
+              --assignee "$PRINCIPAL_ID" \
+              --role "$ACR_REPO_CONTRIBUTOR_ROLE" \
+              --scope "$CONTAINER_REGISTRY_ID" \
+              --output none
+          else
+            echo "  ⏭️  Container Registry Repository Contributor role already assigned to $DISPLAY_NAME"
+          fi
+        done
+        
+        echo "🎯 Container Registry access configuration completed!"
+
+    - name: Output Deployment Results
+      run: |
+        echo "🎉 Infrastructure deployment completed successfully!"
+        echo "📋 Resource Group: ${{ env.AZURE_RESOURCE_GROUP }}"
+        echo "📍 Location: ${{ env.LOCATION }}"
+
+    - name: Update GitHub Secrets with Infrastructure Values
+      run: |
+        echo "🔐 Updating GitHub repository secrets with deployed infrastructure values..."
+        
+        RESOURCE_GROUP="${{ env.AZURE_RESOURCE_GROUP }}"
+        DEPLOYMENT_NAME="main"
+        
+        # Extract values from Azure deployment outputs
+        echo "📋 Extracting values from deployment outputs..."
+        POSTGRESQL_SERVER=$(az deployment group show \
+          --resource-group "${RESOURCE_GROUP}" \
+          --name "${DEPLOYMENT_NAME}" \
+          --query "properties.outputs.postgresServerFqdn.value" \
+          --output tsv)
+        
+        AZURE_STORAGE_ACCOUNT=$(az deployment group show \
+          --resource-group "${RESOURCE_GROUP}" \
+          --name "${DEPLOYMENT_NAME}" \
+          --query "properties.outputs.storageAccountName.value" \
+          --output tsv)
+        
+        # Verify deployment outputs were extracted successfully
+        if [ -z "$POSTGRESQL_SERVER" ] || [ "$POSTGRESQL_SERVER" = "null" ]; then
+          echo "❌ Failed to extract PostgreSQL server FQDN"
+          exit 1
+        fi
+        
+        if [ -z "$AZURE_STORAGE_ACCOUNT" ] || [ "$AZURE_STORAGE_ACCOUNT" = "null" ]; then
+          echo "❌ Failed to extract Azure storage account name"
+          exit 1
+        fi
+        
+        # Extract values from Bicep parameters
+        echo "📄 Extracting values from Bicep parameters..."
+        cd INFRA-NEW
+        POSTGRESQL_USER=$(grep "param postgresAdminUsername" main.bicepparam | sed "s/.*= *'\([^']*\)'.*/\1/")
+        POSTGRESQL_PASSWORD=$(grep "param postgresAdminPassword" main.bicepparam | sed "s/.*= *'\([^']*\)'.*/\1/")
+        
+        # Verify parameter extraction
+        if [ -z "$POSTGRESQL_USER" ]; then
+          echo "❌ Failed to extract PostgreSQL username from main.bicepparam"
+          exit 1
+        fi
+        
+        if [ -z "$POSTGRESQL_PASSWORD" ]; then
+          echo "❌ Failed to extract PostgreSQL password from main.bicepparam"
+          exit 1
+        fi
+        
+        # Set constants
+        AZURE_STORAGE_CONTAINER="data"
+        POSTGRESQL_CATALOGDB="ducklake_catalog"
+        POSTGRESQL_PORT="5432"
+        
+        echo "✅ Extracted values:"
+        echo "   POSTGRESQL_SERVER: $POSTGRESQL_SERVER"
+        echo "   AZURE_STORAGE_ACCOUNT: $AZURE_STORAGE_ACCOUNT"
+        echo "   POSTGRESQL_USER: $POSTGRESQL_USER"
+        echo "   POSTGRESQL_PASSWORD: [HIDDEN]"
+        echo "   AZURE_STORAGE_CONTAINER: $AZURE_STORAGE_CONTAINER"
+        echo "   POSTGRESQL_CATALOGDB: $POSTGRESQL_CATALOGDB"
+        echo "   POSTGRESQL_PORT: $POSTGRESQL_PORT"
+        
+        # Use GitHub CLI to update secrets
+        echo "🔧 Updating GitHub repository secrets..."
+        
+        # Authenticate with GitHub CLI using ADMIN_PAT
+        echo "${{ secrets.ADMIN_PAT }}" | gh auth login --with-token
+        
+        # Set each secret with error checking
+        echo "Setting AZURE_STORAGE_ACCOUNT..."
+        echo "$AZURE_STORAGE_ACCOUNT" | gh secret set AZURE_STORAGE_ACCOUNT
+        
+        echo "Setting AZURE_STORAGE_CONTAINER..."
+        echo "$AZURE_STORAGE_CONTAINER" | gh secret set AZURE_STORAGE_CONTAINER
+        
+        echo "Setting POSTGRESQL_CATALOGDB..."
+        echo "$POSTGRESQL_CATALOGDB" | gh secret set POSTGRESQL_CATALOGDB
+        
+        echo "Setting POSTGRESQL_PASSWORD..."
+        echo "$POSTGRESQL_PASSWORD" | gh secret set POSTGRESQL_PASSWORD
+        
+        echo "Setting POSTGRESQL_USER..."
+        echo "$POSTGRESQL_USER" | gh secret set POSTGRESQL_USER
+        
+        echo "Setting POSTGRESQL_PORT..."
+        echo "$POSTGRESQL_PORT" | gh secret set POSTGRESQL_PORT
+        
+        echo "Setting POSTGRESQL_SERVER..."
+        echo "$POSTGRESQL_SERVER" | gh secret set POSTGRESQL_SERVER
+        
+        echo "✅ All GitHub secrets updated successfully!"
+        echo ""
+        echo "📋 Updated secrets:"
+        echo "   - AZURE_STORAGE_ACCOUNT: $AZURE_STORAGE_ACCOUNT"
+        echo "   - AZURE_STORAGE_CONTAINER: $AZURE_STORAGE_CONTAINER"
+        echo "   - POSTGRESQL_CATALOGDB: $POSTGRESQL_CATALOGDB"
+        echo "   - POSTGRESQL_PASSWORD: [HIDDEN]"
+        echo "   - POSTGRESQL_USER: $POSTGRESQL_USER"
+        echo "   - POSTGRESQL_PORT: $POSTGRESQL_PORT"
+        echo "   - POSTGRESQL_SERVER: $POSTGRESQL_SERVER"

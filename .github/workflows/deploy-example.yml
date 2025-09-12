@@ -1,0 +1,59 @@
+name: Deploy MPZSQL Application
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: false
+        type: choice
+        default: 'deploy-env'
+        options:
+        - deploy-env
+        - staging
+        - prod
+      skip_cleanup:
+        description: 'Skip registry cleanup'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # First register Azure providers
+  register-providers:
+    name: Register Azure Providers
+    uses: ./.github/workflows/register-azure-providers.yml
+    with:
+      environment: ${{ inputs.environment || 'deploy-env' }}
+    secrets: inherit
+
+  # Then build and push the Docker image
+  build-and-push:
+    name: Build and Push Docker Image
+    needs: register-providers
+    uses: ./.github/workflows/build-and-push-image.yml
+    with:
+      environment: ${{ inputs.environment || 'deploy-env' }}
+      image_tag_prefix: ${{ github.ref_name }}
+      registry_cleanup: ${{ !inputs.skip_cleanup }}
+    secrets: inherit
+
+  # Deploy to Azure Container Apps
+  deploy:
+    name: Deploy to Azure Container Apps
+    needs: build-and-push
+    uses: ./.github/workflows/deploy-to-container-app.yml
+    with:
+      environment: ${{ inputs.environment || 'deploy-env' }}
+      image_name: ${{ needs.build-and-push.outputs.image_name }}
+      image_tag: ${{ needs.build-and-push.outputs.image_tag }}
+      registry_name: ${{ needs.build-and-push.outputs.registry_name }}
+    secrets: inherit
