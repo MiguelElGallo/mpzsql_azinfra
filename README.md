@@ -30,9 +30,11 @@ Set these repository secrets before running infrastructure or deployment workflo
 - `AZURE_CLIENT_ID` – Federated workload identity / Service Principal client ID
 - `AZURE_TENANT_ID` – Azure AD tenant ID
 - `AZURE_SUBSCRIPTION_ID` – Azure subscription ID
+More information can be found in this [guide](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect). 
 
 ### GitHub Administration
 - `ADMIN_PAT` – Fine‑scoped PAT used by infra deploy workflow to write repository secrets (repo:actions:write). Avoid classic tokens with broad scopes.
+Go to https://github.com/settings/personal-access-tokens/new for creating the PAT (Personal Access token)
 
 ### Database (populated/consumed after infra deploy)
 Secrets written automatically by the infra deployment workflow (`workflows-deploy-new-infra.yml`) when it runs successfully:
