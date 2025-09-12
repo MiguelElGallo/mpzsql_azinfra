@@ -2,6 +2,12 @@
 
 Comprehensive guide for deploying and operating the MPZSQL cloud-native data lake on Azure Container Apps using Bicep + GitHub Actions. During the image build workflow the step at lines 132–137 of `.github/workflows/build-and-push-image.yml` automatically fetches the latest MPZSQL server source from the upstream repository (https://github.com/miguelElGallo/mpzsql) via `scripts/download-mpzsql.sh`, ensuring each build incorporates the newest server version without manual syncing.
 
+## Warning!
+
+This software is in experimental state. I have not tested the security features yet. The software it uses like DuckLake is also in experimental state. (As of July 2025)
+The moment you deploy this to Azure you *start* incurring costs.
+Do NOT use in production!
+
 ## Overview
 
 MPZSQL combines Ducklake/DuckDB analytics with Azure-managed services:
