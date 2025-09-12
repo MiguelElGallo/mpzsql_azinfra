@@ -399,6 +399,12 @@ cat UPLOAD_CERTIFICATES.md
 
 ### Common Issues
 
+After deployment you need to set one more environment variable to your Azure containter app:
+`MPZSQL_ADVERTISED_HOSTNAME`
+with value
+`xxx.yyy.zzz.azurecontainerapps.io:8080`
+
+
 1. **"Azure Container Registry not found"**
    - Ensure infrastructure deployment completed successfully
    - Check that the registry has the correct tags
