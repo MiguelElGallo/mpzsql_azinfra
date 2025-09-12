@@ -1,10 +1,10 @@
-# Ducklake Infrastructure & Deployment Guide
+# MPZSQL  Infrastructure & Deployment Guide
 
- Comprehensive guide for deploying and operating the MPZSQL cloud-native data lake on Azure Container Apps using Bicep + GitHub Actions. During the image build workflow the step at lines 132–137 of `.github/workflows/build-and-push-image.yml` automatically fetches the latest MPZSQL server source from the upstream repository (https://github.com/miguelElGallo/mpzsql) via `scripts/download-mpzsql.sh`, ensuring each build incorporates the newest server version without manual syncing.
+Comprehensive guide for deploying and operating the MPZSQL cloud-native data lake on Azure Container Apps using Bicep + GitHub Actions. During the image build workflow the step at lines 132–137 of `.github/workflows/build-and-push-image.yml` automatically fetches the latest MPZSQL server source from the upstream repository (https://github.com/miguelElGallo/mpzsql) via `scripts/download-mpzsql.sh`, ensuring each build incorporates the newest server version without manual syncing.
 
 ## Overview
 
-DuckLake combines DuckDB analytics with Azure-managed services:
+MPZSQL combines Ducklake/DuckDB analytics with Azure-managed services:
 - High-performance embedded DuckDB execution engine
 - PostgreSQL Flexible Server for catalog / metadata
 - Azure Blob Storage for persistent data (`data` container)
@@ -201,24 +201,14 @@ Details: `UPLOAD_CERTIFICATES.md`, `scripts/CERTIFICATE_UPLOAD.md`.
 4. Submit PR; include summary of secret / infra changes if any.
 
 ## License
-[Add license information here]
 
----
-Maintained by Ducklake Infra.
-# DuckLake
+MIT
 
-A cloud-native data lake solution built with DuckDB, deployed on Azure Container Apps.
+# MPZSQL
 
-## Overview
+A cloud-native data lake solution built with DuckDB/Ducklake, deployed on Azure Container Apps.
 
-DuckLake is a scalable data analytics platform that combines the power of DuckDB with cloud infrastructure. It provides:
 
-- **High-performance analytics** using DuckDB
-- **Cloud storage integration** with Azure Blob Storage
-- **PostgreSQL catalog** for metadata management
-- **Containerized deployment** on Azure Container Apps
-- **TLS encryption** with Let's Encrypt certificates
-- **Comprehensive logging** with Pydantic Logfire
 
 ## Quick Start
 
