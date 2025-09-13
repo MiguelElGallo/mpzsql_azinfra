@@ -8,6 +8,10 @@ This software is in experimental state. I have not tested the security features 
 The moment you deploy this to Azure you *start* incurring costs.
 Do NOT use in production!
 
+## Howto Video
+
+[Video](https://www.youtube.com/watch?v=5CTXBTp2n6c) available here.
+
 ## Overview
 
 MPZSQL combines Ducklake/DuckDB analytics with Azure-managed services:
